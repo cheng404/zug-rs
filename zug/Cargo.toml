@@ -1,0 +1,48 @@
+[package]
+name = "zug"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "A lightweight Redis-backed async job queue for Rust"
+authors = ["Zug contributors"]
+documentation = "https://docs.rs/zug"
+keywords = ["queue", "jobs", "worker", "scheduling", "cron", "redis", "tokio"]
+license = "MIT"
+readme = "../README.md"
+
+[features]
+default = ["rss-stats"]
+
+# Collect RSS process stats when publishing worker process heartbeats.
+rss-stats = ["dep:sysinfo"]
+
+[lib]
+name = "zug"
+
+[dependencies]
+gethostname = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+serde_json = { version = "1" }
+serde = { version = "1", features = ["derive"] }
+redis = { version = "1", features = ["aio", "tokio-comp"] }
+async-trait = "0.1"
+thiserror = "2"
+bb8 = "0.9"
+num_cpus = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rand = "0.10"
+uuid = { version = "1", features = ["v7"] }
+hex = "0.4"
+cron = "0.16"
+sysinfo = { version = "0.38", optional = true, default-features = false, features = ["system"] }
+sha2 = "0.11"
+tracing = "0.1"
+inventory = "0.3"
+indexmap = "2"
+toml = "0.9"
+zug-macros = { path = "../zug-macros" }
+
+[dev-dependencies]
+serial_test = "3"
+tracing-subscriber = { version = "0.3", features = ["json"] }
