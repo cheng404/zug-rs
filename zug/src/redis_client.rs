@@ -1,3 +1,4 @@
+use crate::job::ZUG_REDIS_FUNCTION_LIBRARY;
 use bb8::{CustomizeConnection, ManageConnection, Pool};
 use redis::AsyncCommands;
 pub use redis::RedisError;
@@ -8,7 +9,8 @@ use redis::{ToRedisArgs, ToSingleRedisArg};
 use std::future::Future;
 use std::ops::DerefMut;
 use std::pin::Pin;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, OnceCell};
 
 pub type RedisPool = Pool<RedisConnectionManager>;
 
@@ -41,6 +43,7 @@ pub fn with_custom_namespace(namespace: String) -> Box<RedisNamespace> {
 #[derive(Clone, Debug)]
 pub struct RedisConnectionManager {
     client: Client,
+    functions_loaded: Arc<OnceCell<()>>,
 }
 
 impl RedisConnectionManager {
@@ -56,8 +59,30 @@ impl RedisConnectionManager {
 
         Ok(Self {
             client: Client::open(connection_info)?,
+            functions_loaded: Arc::new(OnceCell::new()),
         })
     }
+
+    async fn ensure_function_library_loaded(
+        &self,
+        connection: &mut Connection,
+    ) -> Result<(), RedisError> {
+        self.functions_loaded
+            .get_or_try_init(|| async { load_zug_function_library(connection).await })
+            .await
+            .map(|_| ())
+    }
+}
+
+async fn load_zug_function_library(connection: &mut Connection) -> Result<(), RedisError> {
+    let _: String = redis::cmd("FUNCTION")
+        .arg("LOAD")
+        .arg("REPLACE")
+        .arg(ZUG_REDIS_FUNCTION_LIBRARY)
+        .query_async(connection)
+        .await?;
+
+    Ok(())
 }
 
 impl ManageConnection for RedisConnectionManager {
@@ -65,9 +90,12 @@ impl ManageConnection for RedisConnectionManager {
     type Error = RedisError;
 
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        let mut connection = self.client.get_multiplexed_async_connection().await?;
+        self.ensure_function_library_loaded(&mut connection).await?;
+
         Ok(RedisConnection::with_client(
             self.client.clone(),
-            self.client.get_multiplexed_async_connection().await?,
+            connection,
         ))
     }
 

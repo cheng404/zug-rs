@@ -2,6 +2,7 @@
 mod test {
     use async_trait::async_trait;
     use bb8::Pool;
+    use serial_test::serial;
     use std::sync::{Arc, Mutex};
     use zug::{
         job_status, job_status_ttl, BalanceStrategy, JobStatus, Processor, ProcessorConfig,
@@ -49,6 +50,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial]
     async fn can_process_an_async_job() {
         #[derive(Clone)]
         struct TestWorker {
@@ -84,6 +86,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial]
     async fn worker_can_access_processor_state() {
         #[derive(Clone)]
         struct AppState {
@@ -124,6 +127,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial]
     async fn records_async_job_status_lifecycle() {
         #[derive(Clone)]
         struct TestWorker;
@@ -171,6 +175,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial]
     async fn derives_active_status_from_queue_score() {
         #[derive(Clone)]
         struct TestWorker;
@@ -226,6 +231,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial]
     async fn fetch_redelivers_after_lease_timeout() {
         #[derive(Clone)]
         struct TestWorker;
@@ -270,6 +276,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial]
     async fn can_customize_job_status_ttl_from_worker_opts() {
         #[derive(Clone)]
         struct TestWorker;

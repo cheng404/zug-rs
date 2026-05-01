@@ -13,8 +13,7 @@ pub use crate::redis_client::{
     with_custom_namespace, RedisConnection, RedisConnectionManager, RedisError, RedisPool,
 };
 pub(crate) use job::{
-    current_timestamp_score, in_progress_key, job_key, queue_key, queue_wake_channel,
-    record_job_status_direct,
+    current_timestamp_score, fetch_job_atomic_direct, queue_key, queue_wake_channel,
 };
 pub use job::{
     job_status, job_status_ttl, opts, perform_async, EnqueueOpts, Job, JobStatus, RetryOpts,

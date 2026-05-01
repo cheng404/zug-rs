@@ -46,23 +46,28 @@ pub(crate) fn current_timestamp_score() -> f64 {
     unix_timestamp_score(chrono::Utc::now())
 }
 
-const ENQUEUE_JOB_SCRIPT: &str = r#"
-local queues_key = KEYS[1]
-local job_key = KEYS[2]
-local queue_key = KEYS[3]
-local status_key = KEYS[4]
-local unique_key = KEYS[5]
-local remove_queue_key = KEYS[6]
-local in_progress_key = KEYS[7]
+pub(crate) const ENQUEUE_JOB_FUNCTION_NAME: &str = "zug_enqueue_job";
+pub(crate) const FETCH_JOB_FUNCTION_NAME: &str = "zug_fetch_job";
+pub(crate) const COMPLETE_JOB_FUNCTION_NAME: &str = "zug_complete_job";
 
-local queue_name = ARGV[1]
-local job_id = ARGV[2]
-local job_payload = ARGV[3]
-local score = ARGV[4]
-local status = ARGV[5]
-local status_ttl = ARGV[6]
-local unique_ttl = ARGV[7]
-local check_existing = ARGV[8]
+pub(crate) const ZUG_REDIS_FUNCTION_LIBRARY: &str = r#"#!lua name=zug
+redis.register_function('zug_enqueue_job', function(keys, args)
+local queues_key = keys[1]
+local job_key = keys[2]
+local queue_key = keys[3]
+local status_key = keys[4]
+local unique_key = keys[5]
+local remove_queue_key = keys[6]
+local in_progress_key = keys[7]
+
+local queue_name = args[1]
+local job_id = args[2]
+local job_payload = args[3]
+local score = args[4]
+local status = args[5]
+local status_ttl = args[6]
+local unique_ttl = args[7]
+local check_existing = args[8]
 
 if check_existing == '1' then
     if redis.call('EXISTS', job_key) == 1 or redis.call('HEXISTS', status_key, job_id) == 1 then
@@ -93,6 +98,74 @@ redis.call('HSET', status_key, job_id, status)
 redis.call('HEXPIRE', status_key, status_ttl, 'FIELDS', 1, job_id)
 
 return 1
+end)
+
+redis.register_function('zug_fetch_job', function(keys, args)
+local queue_key = keys[1]
+local status_key = keys[2]
+
+local job_key_prefix = args[1]
+local in_progress_key_prefix = args[2]
+local now = args[3]
+local candidate_limit = tonumber(args[4])
+local lease_timeout = args[5]
+local status = args[6]
+local default_status_ttl = args[7]
+
+local job_ids = redis.call('ZRANGEBYSCORE', queue_key, '-inf', now, 'LIMIT', 0, candidate_limit)
+
+for _, job_id in ipairs(job_ids) do
+    local in_progress_key = in_progress_key_prefix .. job_id
+    local claimed = redis.call('SET', in_progress_key, '', 'NX', 'EX', lease_timeout)
+
+    if claimed then
+        local job_key = job_key_prefix .. job_id
+        local job_payload = redis.call('GET', job_key)
+
+        if job_payload then
+            local status_ttl = default_status_ttl
+            local decoded, job = pcall(cjson.decode, job_payload)
+            if decoded and job['status_ttl_seconds'] then
+                status_ttl = job['status_ttl_seconds']
+            end
+
+            redis.call('HSET', status_key, job_id, status)
+            redis.call('HEXPIRE', status_key, status_ttl, 'FIELDS', 1, job_id)
+
+            return job_payload
+        end
+
+        redis.call('ZREM', queue_key, job_id)
+        redis.call('DEL', in_progress_key)
+    end
+end
+
+return false
+end)
+
+redis.register_function('zug_complete_job', function(keys, args)
+local source_queue_key = keys[1]
+local destination_queue_key = keys[2]
+local job_key = keys[3]
+local in_progress_key = keys[4]
+local status_key = keys[5]
+
+local job_id = args[1]
+local status = args[2]
+local status_ttl = args[3]
+
+redis.call('ZREM', source_queue_key, job_id)
+if destination_queue_key ~= source_queue_key then
+    redis.call('ZREM', destination_queue_key, job_id)
+end
+redis.call('DEL', job_key)
+redis.call('DEL', in_progress_key)
+redis.call('HSET', status_key, job_id, status)
+redis.call('HEXPIRE', status_key, status_ttl, 'FIELDS', 1, job_id)
+
+return 1
+end)
+
 "#;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -481,6 +554,10 @@ fn namespaced_optional_key(redis: &RedisConnection, key: Option<String>) -> Stri
     key.map(|key| redis.namespaced_key(key)).unwrap_or_default()
 }
 
+fn namespaced_key_prefix(redis: &RedisConnection, prefix: &str) -> String {
+    redis.namespaced_key(prefix.to_string())
+}
+
 struct AtomicEnqueue<'a> {
     job: &'a Job,
     score: f64,
@@ -511,9 +588,9 @@ async fn enqueue_job_atomic_direct(
         None
     };
 
-    let mut command = redis_cmd("EVAL");
+    let mut command = redis_cmd("FCALL");
     command
-        .arg(ENQUEUE_JOB_SCRIPT)
+        .arg(ENQUEUE_JOB_FUNCTION_NAME)
         .arg(7)
         .arg(redis.namespaced_key("queues".to_string()))
         .arg(redis.namespaced_key(job_key(&enqueue.job.job_id)))
@@ -536,6 +613,59 @@ async fn enqueue_job_atomic_direct(
     Ok(enqueued == 1)
 }
 
+pub(crate) async fn fetch_job_atomic_direct(
+    redis: &mut RedisConnection,
+    queue: String,
+    now: f64,
+    candidate_limit: isize,
+    lease_timeout_seconds: usize,
+) -> Result<Option<Job>> {
+    let mut command = redis_cmd("FCALL");
+    command
+        .arg(FETCH_JOB_FUNCTION_NAME)
+        .arg(2)
+        .arg(redis.namespaced_key(queue))
+        .arg(redis.namespaced_key(JOB_STATUS_HASH_KEY.to_string()))
+        .arg(namespaced_key_prefix(redis, "job:"))
+        .arg(namespaced_key_prefix(redis, "in-progress:"))
+        .arg(now)
+        .arg(candidate_limit)
+        .arg(lease_timeout_seconds)
+        .arg(JobStatus::InProgress.as_str())
+        .arg(DEFAULT_JOB_STATUS_TTL_SECONDS);
+
+    let job_raw: Option<String> = redis.query_prepared_command(&mut command).await?;
+
+    job_raw
+        .map(|job_raw| serde_json::from_str(&job_raw))
+        .transpose()
+        .map_err(Into::into)
+}
+
+async fn complete_job_atomic_direct(
+    redis: &mut RedisConnection,
+    source_queue: String,
+    destination_queue: String,
+    job: &Job,
+) -> Result<()> {
+    let mut command = redis_cmd("FCALL");
+    command
+        .arg(COMPLETE_JOB_FUNCTION_NAME)
+        .arg(5)
+        .arg(redis.namespaced_key(source_queue))
+        .arg(redis.namespaced_key(destination_queue))
+        .arg(redis.namespaced_key(job_key(&job.job_id)))
+        .arg(redis.namespaced_key(in_progress_key(&job.job_id)))
+        .arg(redis.namespaced_key(JOB_STATUS_HASH_KEY.to_string()))
+        .arg(job.job_id.clone())
+        .arg(JobStatus::Complete.as_str())
+        .arg(job.status_ttl_seconds);
+
+    let _: i64 = redis.query_prepared_command(&mut command).await?;
+
+    Ok(())
+}
+
 impl UnitOfWork {
     #[must_use]
     pub fn from_job(job: Job) -> Self {
@@ -548,17 +678,6 @@ impl UnitOfWork {
     pub async fn enqueue(&self, redis: &RedisPool) -> Result<bool> {
         let mut redis = redis.get().await?;
         self.enqueue_direct(&mut redis).await
-    }
-
-    async fn record_status_direct(
-        &mut self,
-        redis: &mut RedisConnection,
-        status: JobStatus,
-        ttl_in_seconds: usize,
-    ) -> Result<()> {
-        record_job_status_direct(redis, &self.job.job_id, status, ttl_in_seconds).await?;
-
-        Ok(())
     }
 
     pub(crate) async fn enqueue_direct(&self, redis: &mut RedisConnection) -> Result<bool> {
@@ -593,18 +712,7 @@ impl UnitOfWork {
     async fn complete_direct(&mut self, redis: &mut RedisConnection) -> Result<()> {
         let destination_queue = queue_key(&self.job.queue);
 
-        redis
-            .zrem(self.queue.clone(), self.job.job_id.clone())
-            .await?;
-        if destination_queue != self.queue {
-            redis
-                .zrem(destination_queue, self.job.job_id.clone())
-                .await?;
-        }
-        redis.del(job_key(&self.job.job_id)).await?;
-        redis.del(in_progress_key(&self.job.job_id)).await?;
-        self.record_status_direct(redis, JobStatus::Complete, self.job.status_ttl_seconds)
-            .await?;
+        complete_job_atomic_direct(redis, self.queue.clone(), destination_queue, &self.job).await?;
 
         Ok(())
     }
@@ -684,24 +792,6 @@ async fn publish_queue_wake_direct(redis: &mut RedisConnection, queue: &str, job
     if let Err(err) = redis.publish(queue_wake_channel(queue), job_id).await {
         tracing::debug!("failed to publish Zug wake notification: {err:?}");
     }
-}
-
-pub(crate) async fn record_job_status_direct(
-    redis: &mut RedisConnection,
-    job_id: &str,
-    status: JobStatus,
-    ttl_in_seconds: usize,
-) -> Result<()> {
-    redis
-        .hset_with_field_ttl(
-            JOB_STATUS_HASH_KEY.to_string(),
-            job_id.to_string(),
-            status.as_str(),
-            ttl_in_seconds,
-        )
-        .await?;
-
-    Ok(())
 }
 
 #[cfg(test)]

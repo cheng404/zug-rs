@@ -1,9 +1,8 @@
 use super::Result;
 use crate::{
-    current_timestamp_score, in_progress_key, job_key, queue_key, queue_wake_channel,
-    record_job_status_direct, registry,
+    current_timestamp_score, fetch_job_atomic_direct, queue_key, queue_wake_channel, registry,
     schedule::{self, ScheduledJob},
-    Chain, Counter, Error, Job, JobStatus, RedisPool, ServerMiddleware, StatsPublisher, UnitOfWork,
+    Chain, Counter, Error, JobStatus, RedisPool, ServerMiddleware, StatsPublisher, UnitOfWork,
     Worker, WorkerContext, WorkerRef,
 };
 use indexmap::IndexSet;
@@ -306,33 +305,15 @@ impl Processor {
             .max(1);
 
         for queue in self.queues.clone() {
-            let job_ids: Vec<String> = redis
-                .zrangebyscore_limit(queue.clone(), "-inf", now, 0, FETCH_CANDIDATE_LIMIT)
-                .await?;
-
-            for job_id in job_ids {
-                let claimed = redis
-                    .set_nx_ex_bool(in_progress_key(&job_id), "", lease_timeout)
-                    .await?;
-                if !claimed {
-                    continue;
-                }
-
-                let Some(job_raw) = redis.get(job_key(&job_id)).await? else {
-                    redis.zrem(queue.clone(), job_id.clone()).await?;
-                    redis.del(in_progress_key(&job_id)).await?;
-                    continue;
-                };
-
-                let job: Job = serde_json::from_str(&job_raw)?;
-                record_job_status_direct(
-                    &mut redis,
-                    &job.job_id,
-                    JobStatus::InProgress,
-                    job.status_ttl_seconds,
-                )
-                .await?;
-
+            if let Some(job) = fetch_job_atomic_direct(
+                &mut redis,
+                queue.clone(),
+                now,
+                FETCH_CANDIDATE_LIMIT,
+                lease_timeout,
+            )
+            .await?
+            {
                 return Ok(Some(UnitOfWork { queue, job }));
             }
         }

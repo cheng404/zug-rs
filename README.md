@@ -12,7 +12,8 @@ applications that need background work without a large runtime or service depend
 
 Zug requires Redis 7.4 or newer and uses RESP3 connections. Job status retention uses Redis
 hash-field expiration (`HEXPIRE`/`HTTL`), which was introduced in Redis 7.4. Worker wakeups use
-RESP3 pub/sub as a best-effort latency optimization.
+RESP3 pub/sub as a best-effort latency optimization. Zug registers its Redis Function library when
+opening Redis connections and uses `FCALL` for atomic queue state transitions.
 
 ## Install
 
@@ -208,7 +209,7 @@ Available options:
 - `job_status_ttl(duration)` controls how long Redis keeps the job's final status after the job leaves a queue. The default is 48 hours.
 
 Job creation writes the payload, queue membership, sorted-set score, uniqueness lock, and status
-field in one Redis script. Duplicate unique jobs return `None` from `perform_async`.
+field in one Redis Function call. Duplicate unique jobs return `None` from `perform_async`.
 See
 [zug/examples/unique.rs](zug/examples/unique.rs) for a complete example.
 
@@ -532,9 +533,9 @@ The main Redis keys are:
 
 ### Redis Operation Sketch
 
-The core queue operations are intentionally small. Immediate enqueueing writes the job payload,
-adds the job id to the target queue zset with a score of now, records status, and publishes a wake
-hint:
+The core queue operations are intentionally small. Immediate enqueueing uses `FCALL` to write the
+job payload, add the job id to the target queue zset with a score of now, and record status with its
+field TTL. After the function succeeds, Zug publishes a wake hint:
 
 ```redis
 SET job:<job_id> <serialized job>
@@ -555,9 +556,10 @@ HEXPIRE job-status <seconds until ready_at + status ttl> FIELDS 1 <job_id>
 PUBLISH queue:<name>:wake <job_id>
 ```
 
-Fetching work scans due job ids and tries to acquire a lease. This is the distributed coordination
-point: every worker may see the same due job id, but only one worker can create `in-progress:<job_id>`
-before the lease expires.
+Fetching work uses `FCALL` to scan due job ids, acquire a lease, read the payload, clean up orphaned
+queue entries, and mark the job `in_progress`. This is the distributed coordination point: every
+worker may see the same due job id, but only one worker can create `in-progress:<job_id>` before the
+lease expires.
 
 ```redis
 ZRANGEBYSCORE queue:<name> -inf <now> LIMIT 0 50
@@ -567,8 +569,9 @@ HSET job-status <job_id> in_progress
 HEXPIRE job-status <status_ttl_seconds> FIELDS 1 <job_id>
 ```
 
-When work finishes successfully, or when retries are disabled or exhausted, Zug acknowledges the
-job by removing queue state and keeping only the terminal status for the configured status TTL:
+When work finishes successfully, or when retries are disabled or exhausted, Zug uses `FCALL` to
+acknowledge the job by removing queue state and keeping only the terminal status for the configured
+status TTL:
 
 ```redis
 ZREM queue:<name> <job_id>
