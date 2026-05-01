@@ -7,6 +7,7 @@ use serde::{
 };
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
+use std::sync::LazyLock;
 
 pub(crate) const JOB_STATUS_HASH_KEY: &str = "job-status";
 const JOB_KEY_PREFIX: &str = "job";
@@ -46,12 +47,74 @@ pub(crate) fn current_timestamp_score() -> f64 {
     unix_timestamp_score(chrono::Utc::now())
 }
 
-pub(crate) const ENQUEUE_JOB_FUNCTION_NAME: &str = "zug_enqueue_job";
-pub(crate) const FETCH_JOB_FUNCTION_NAME: &str = "zug_fetch_job";
-pub(crate) const COMPLETE_JOB_FUNCTION_NAME: &str = "zug_complete_job";
+const ENQUEUE_JOB_FUNCTION_BASENAME: &str = "zug_enqueue_job";
+const FETCH_JOB_FUNCTION_BASENAME: &str = "zug_fetch_job";
+const COMPLETE_JOB_FUNCTION_BASENAME: &str = "zug_complete_job";
+const REDIS_FUNCTION_FINGERPRINT_LEN: usize = 16;
 
-pub(crate) const ZUG_REDIS_FUNCTION_LIBRARY: &str = r#"#!lua name=zug
-redis.register_function('zug_enqueue_job', function(keys, args)
+static REDIS_FUNCTION_FINGERPRINT: LazyLock<String> = LazyLock::new(|| {
+    let mut hasher = Sha256::new();
+    hasher.update(include_str!("job.rs").as_bytes());
+    hasher.update(ZUG_REDIS_FUNCTION_LIBRARY_TEMPLATE.as_bytes());
+    hasher.update(ENQUEUE_JOB_FUNCTION_BASENAME.as_bytes());
+    hasher.update(FETCH_JOB_FUNCTION_BASENAME.as_bytes());
+    hasher.update(COMPLETE_JOB_FUNCTION_BASENAME.as_bytes());
+    hex::encode(hasher.finalize())[..REDIS_FUNCTION_FINGERPRINT_LEN].to_string()
+});
+
+static ENQUEUE_JOB_FUNCTION_NAME: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{ENQUEUE_JOB_FUNCTION_BASENAME}_{}",
+        REDIS_FUNCTION_FINGERPRINT.as_str()
+    )
+});
+static FETCH_JOB_FUNCTION_NAME: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{FETCH_JOB_FUNCTION_BASENAME}_{}",
+        REDIS_FUNCTION_FINGERPRINT.as_str()
+    )
+});
+static COMPLETE_JOB_FUNCTION_NAME: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{COMPLETE_JOB_FUNCTION_BASENAME}_{}",
+        REDIS_FUNCTION_FINGERPRINT.as_str()
+    )
+});
+static ZUG_REDIS_FUNCTION_LIBRARY_NAME: LazyLock<String> =
+    LazyLock::new(|| format!("zug_{}", REDIS_FUNCTION_FINGERPRINT.as_str()));
+
+static ZUG_REDIS_FUNCTION_LIBRARY: LazyLock<String> = LazyLock::new(|| {
+    ZUG_REDIS_FUNCTION_LIBRARY_TEMPLATE
+        .replace(
+            "__ZUG_REDIS_FUNCTION_LIBRARY_NAME__",
+            ZUG_REDIS_FUNCTION_LIBRARY_NAME.as_str(),
+        )
+        .replace("__ENQUEUE_JOB_FUNCTION_NAME__", enqueue_job_function_name())
+        .replace("__FETCH_JOB_FUNCTION_NAME__", fetch_job_function_name())
+        .replace(
+            "__COMPLETE_JOB_FUNCTION_NAME__",
+            complete_job_function_name(),
+        )
+});
+
+pub(crate) fn enqueue_job_function_name() -> &'static str {
+    ENQUEUE_JOB_FUNCTION_NAME.as_str()
+}
+
+pub(crate) fn fetch_job_function_name() -> &'static str {
+    FETCH_JOB_FUNCTION_NAME.as_str()
+}
+
+pub(crate) fn complete_job_function_name() -> &'static str {
+    COMPLETE_JOB_FUNCTION_NAME.as_str()
+}
+
+pub(crate) fn zug_redis_function_library() -> &'static str {
+    ZUG_REDIS_FUNCTION_LIBRARY.as_str()
+}
+
+const ZUG_REDIS_FUNCTION_LIBRARY_TEMPLATE: &str = r#"#!lua name=__ZUG_REDIS_FUNCTION_LIBRARY_NAME__
+redis.register_function('__ENQUEUE_JOB_FUNCTION_NAME__', function(keys, args)
 local queues_key = keys[1]
 local job_key = keys[2]
 local queue_key = keys[3]
@@ -68,6 +131,7 @@ local status = args[5]
 local status_ttl = args[6]
 local unique_ttl = args[7]
 local check_existing = args[8]
+local lease_token = args[9]
 
 if check_existing == '1' then
     if redis.call('EXISTS', job_key) == 1 or redis.call('HEXISTS', status_key, job_id) == 1 then
@@ -91,6 +155,9 @@ if remove_queue_key ~= '' then
 end
 
 if in_progress_key ~= '' then
+    if lease_token == '' or redis.call('GET', in_progress_key) ~= lease_token then
+        return 0
+    end
     redis.call('DEL', in_progress_key)
 end
 
@@ -100,7 +167,7 @@ redis.call('HEXPIRE', status_key, status_ttl, 'FIELDS', 1, job_id)
 return 1
 end)
 
-redis.register_function('zug_fetch_job', function(keys, args)
+redis.register_function('__FETCH_JOB_FUNCTION_NAME__', function(keys, args)
 local queue_key = keys[1]
 local status_key = keys[2]
 
@@ -111,12 +178,13 @@ local candidate_limit = tonumber(args[4])
 local lease_timeout = args[5]
 local status = args[6]
 local default_status_ttl = args[7]
+local lease_token = args[8]
 
 local job_ids = redis.call('ZRANGEBYSCORE', queue_key, '-inf', now, 'LIMIT', 0, candidate_limit)
 
 for _, job_id in ipairs(job_ids) do
     local in_progress_key = in_progress_key_prefix .. job_id
-    local claimed = redis.call('SET', in_progress_key, '', 'NX', 'EX', lease_timeout)
+    local claimed = redis.call('SET', in_progress_key, lease_token, 'NX', 'EX', lease_timeout)
 
     if claimed then
         local job_key = job_key_prefix .. job_id
@@ -143,7 +211,7 @@ end
 return false
 end)
 
-redis.register_function('zug_complete_job', function(keys, args)
+redis.register_function('__COMPLETE_JOB_FUNCTION_NAME__', function(keys, args)
 local source_queue_key = keys[1]
 local destination_queue_key = keys[2]
 local job_key = keys[3]
@@ -153,6 +221,11 @@ local status_key = keys[5]
 local job_id = args[1]
 local status = args[2]
 local status_ttl = args[3]
+local lease_token = args[4]
+
+if lease_token == '' or redis.call('GET', in_progress_key) ~= lease_token then
+    return 0
+end
 
 redis.call('ZREM', source_queue_key, job_id)
 if destination_queue_key ~= source_queue_key then
@@ -388,6 +461,7 @@ impl EnqueueOpts {
             retried_at: None,
             retry_queue: self.retry_queue.clone(),
             unique_for: self.unique_for,
+            lease_token: None,
         })
     }
 
@@ -421,6 +495,10 @@ pub async fn perform_async(
 }
 
 pub(crate) fn new_job_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+fn new_lease_token() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
@@ -532,6 +610,9 @@ pub struct Job {
 
     #[serde(skip)]
     pub unique_for: Option<std::time::Duration>,
+
+    #[serde(skip)]
+    pub lease_token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -566,6 +647,7 @@ struct AtomicEnqueue<'a> {
     check_existing_job: bool,
     remove_from_queue: Option<String>,
     clear_in_progress: bool,
+    lease_token: Option<String>,
 }
 
 async fn enqueue_job_atomic_direct(
@@ -587,10 +669,16 @@ async fn enqueue_job_atomic_direct(
     } else {
         None
     };
+    if enqueue.clear_in_progress && enqueue.lease_token.is_none() {
+        return Err(Error::Message(format!(
+            "missing lease token for job {}",
+            enqueue.job.job_id
+        )));
+    }
 
     let mut command = redis_cmd("FCALL");
     command
-        .arg(ENQUEUE_JOB_FUNCTION_NAME)
+        .arg(enqueue_job_function_name())
         .arg(7)
         .arg(redis.namespaced_key("queues".to_string()))
         .arg(redis.namespaced_key(job_key(&enqueue.job.job_id)))
@@ -606,7 +694,8 @@ async fn enqueue_job_atomic_direct(
         .arg(enqueue.status.as_str())
         .arg(enqueue.status_ttl_seconds)
         .arg(unique_ttl_seconds)
-        .arg(if enqueue.check_existing_job { "1" } else { "0" });
+        .arg(if enqueue.check_existing_job { "1" } else { "0" })
+        .arg(enqueue.lease_token.as_deref().unwrap_or(""));
 
     let enqueued: i64 = redis.query_prepared_command(&mut command).await?;
 
@@ -620,9 +709,10 @@ pub(crate) async fn fetch_job_atomic_direct(
     candidate_limit: isize,
     lease_timeout_seconds: usize,
 ) -> Result<Option<Job>> {
+    let lease_token = new_lease_token();
     let mut command = redis_cmd("FCALL");
     command
-        .arg(FETCH_JOB_FUNCTION_NAME)
+        .arg(fetch_job_function_name())
         .arg(2)
         .arg(redis.namespaced_key(queue))
         .arg(redis.namespaced_key(JOB_STATUS_HASH_KEY.to_string()))
@@ -632,14 +722,18 @@ pub(crate) async fn fetch_job_atomic_direct(
         .arg(candidate_limit)
         .arg(lease_timeout_seconds)
         .arg(JobStatus::InProgress.as_str())
-        .arg(DEFAULT_JOB_STATUS_TTL_SECONDS);
+        .arg(DEFAULT_JOB_STATUS_TTL_SECONDS)
+        .arg(lease_token.clone());
 
     let job_raw: Option<String> = redis.query_prepared_command(&mut command).await?;
 
-    job_raw
-        .map(|job_raw| serde_json::from_str(&job_raw))
-        .transpose()
-        .map_err(Into::into)
+    Ok(job_raw
+        .map(|job_raw| -> Result<Job> {
+            let mut job = serde_json::from_str::<Job>(&job_raw)?;
+            job.lease_token = Some(lease_token);
+            Ok(job)
+        })
+        .transpose()?)
 }
 
 async fn complete_job_atomic_direct(
@@ -648,9 +742,13 @@ async fn complete_job_atomic_direct(
     destination_queue: String,
     job: &Job,
 ) -> Result<()> {
+    let lease_token = job
+        .lease_token
+        .as_deref()
+        .ok_or_else(|| Error::Message(format!("missing lease token for job {}", job.job_id)))?;
     let mut command = redis_cmd("FCALL");
     command
-        .arg(COMPLETE_JOB_FUNCTION_NAME)
+        .arg(complete_job_function_name())
         .arg(5)
         .arg(redis.namespaced_key(source_queue))
         .arg(redis.namespaced_key(destination_queue))
@@ -659,9 +757,16 @@ async fn complete_job_atomic_direct(
         .arg(redis.namespaced_key(JOB_STATUS_HASH_KEY.to_string()))
         .arg(job.job_id.clone())
         .arg(JobStatus::Complete.as_str())
-        .arg(job.status_ttl_seconds);
+        .arg(job.status_ttl_seconds)
+        .arg(lease_token);
 
-    let _: i64 = redis.query_prepared_command(&mut command).await?;
+    let completed: i64 = redis.query_prepared_command(&mut command).await?;
+    if completed != 1 {
+        return Err(Error::Message(format!(
+            "job lease no longer owned: {}",
+            job.job_id
+        )));
+    }
 
     Ok(())
 }
@@ -694,6 +799,7 @@ impl UnitOfWork {
                 check_existing_job: true,
                 remove_from_queue: None,
                 clear_in_progress: false,
+                lease_token: None,
             },
         )
         .await?;
@@ -739,9 +845,16 @@ impl UnitOfWork {
                     remove_from_queue: (destination_queue != self.queue)
                         .then_some(self.queue.clone()),
                     clear_in_progress: true,
+                    lease_token: self.job.lease_token.clone(),
                 },
             )
             .await?;
+            if !enqueued {
+                return Err(Error::Message(format!(
+                    "job lease no longer owned: {}",
+                    self.job.job_id
+                )));
+            }
             if enqueued {
                 publish_queue_wake_direct(&mut redis, &self.job.queue, &self.job.job_id).await;
             }
@@ -777,6 +890,7 @@ impl UnitOfWork {
                 check_existing_job: true,
                 remove_from_queue: None,
                 clear_in_progress: false,
+                lease_token: None,
             },
         )
         .await?;

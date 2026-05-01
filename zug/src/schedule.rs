@@ -220,6 +220,7 @@ impl ScheduledJob {
             retried_at: None,
             retry_queue: None,
             unique_for: None,
+            lease_token: None,
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::job::ZUG_REDIS_FUNCTION_LIBRARY;
+use crate::job::zug_redis_function_library;
 use bb8::{CustomizeConnection, ManageConnection, Pool};
 use redis::AsyncCommands;
 pub use redis::RedisError;
@@ -78,7 +78,7 @@ async fn load_zug_function_library(connection: &mut Connection) -> Result<(), Re
     let _: String = redis::cmd("FUNCTION")
         .arg("LOAD")
         .arg("REPLACE")
-        .arg(ZUG_REDIS_FUNCTION_LIBRARY)
+        .arg(zug_redis_function_library())
         .query_async(connection)
         .await?;
 

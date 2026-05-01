@@ -265,14 +265,29 @@ mod test {
 
         UnitOfWork::from_job(job).enqueue(&redis).await.unwrap();
 
-        let first = p.fetch().await.unwrap().unwrap();
+        let mut first = p.fetch().await.unwrap().unwrap();
         assert_eq!(first.job.job_id, job_id);
+        let first_lease_token = first.job.lease_token.clone();
+        assert!(first_lease_token.is_some());
         assert!(p.fetch().await.unwrap().is_none());
 
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
-        let second = p.fetch().await.unwrap().unwrap();
+        let mut second = p.fetch().await.unwrap().unwrap();
         assert_eq!(second.job.job_id, job_id);
+        assert_ne!(second.job.lease_token, first_lease_token);
+
+        assert!(first.complete(&redis).await.is_err());
+        assert_eq!(
+            job_status(&redis, &job_id).await.unwrap(),
+            JobStatus::InProgress
+        );
+
+        second.complete(&redis).await.unwrap();
+        assert_eq!(
+            job_status(&redis, &job_id).await.unwrap(),
+            JobStatus::Complete
+        );
     }
 
     #[tokio::test]

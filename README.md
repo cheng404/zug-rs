@@ -13,7 +13,9 @@ applications that need background work without a large runtime or service depend
 Zug requires Redis 7.4 or newer and uses RESP3 connections. Job status retention uses Redis
 hash-field expiration (`HEXPIRE`/`HTTL`), which was introduced in Redis 7.4. Worker wakeups use
 RESP3 pub/sub as a best-effort latency optimization. Zug registers its Redis Function library when
-opening Redis connections and uses `FCALL` for atomic queue state transitions.
+opening Redis connections and uses `FCALL` for atomic queue state transitions. Function library and
+function names include a content fingerprint, so rolling deploys with changed function argument
+protocols can run old and new code side by side.
 
 ## Install
 
@@ -556,14 +558,15 @@ HEXPIRE job-status <seconds until ready_at + status ttl> FIELDS 1 <job_id>
 PUBLISH queue:<name>:wake <job_id>
 ```
 
-Fetching work uses `FCALL` to scan due job ids, acquire a lease, read the payload, clean up orphaned
-queue entries, and mark the job `in_progress`. This is the distributed coordination point: every
-worker may see the same due job id, but only one worker can create `in-progress:<job_id>` before the
-lease expires.
+Fetching work uses `FCALL` to scan due job ids, acquire a tokenized lease, read the payload, clean up
+orphaned queue entries, and mark the job `in_progress`. This is the distributed coordination point:
+every worker may see the same due job id, but only one worker can create `in-progress:<job_id>`
+before the lease expires. The lease value is a per-fetch token that must match when the worker later
+completes or retries the job.
 
 ```redis
 ZRANGEBYSCORE queue:<name> -inf <now> LIMIT 0 50
-SET in-progress:<job_id> "" NX EX <lease_timeout_seconds>
+SET in-progress:<job_id> <lease_token> NX EX <lease_timeout_seconds>
 GET job:<job_id>
 HSET job-status <job_id> in_progress
 HEXPIRE job-status <status_ttl_seconds> FIELDS 1 <job_id>
@@ -571,7 +574,8 @@ HEXPIRE job-status <status_ttl_seconds> FIELDS 1 <job_id>
 
 When work finishes successfully, or when retries are disabled or exhausted, Zug uses `FCALL` to
 acknowledge the job by removing queue state and keeping only the terminal status for the configured
-status TTL:
+status TTL. The completion function first verifies that `in-progress:<job_id>` still contains the
+worker's lease token; stale workers cannot complete jobs after another worker has reacquired them.
 
 ```redis
 ZREM queue:<name> <job_id>
@@ -581,8 +585,8 @@ HSET job-status <job_id> complete
 HEXPIRE job-status <status_ttl_seconds> FIELDS 1 <job_id>
 ```
 
-When a job should retry, Zug updates the payload, moves the same job id to its retry time, clears the
-current lease, and records `deferred`:
+When a job should retry, Zug verifies the same lease token, then updates the payload, moves the same
+job id to its retry time, clears the current lease, and records `deferred`:
 
 ```redis
 SET job:<job_id> <serialized job with retry_count and error fields>
