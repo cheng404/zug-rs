@@ -31,11 +31,11 @@ If you do not need process RSS metrics, disable default features.
 zug = { version = "0.1", default-features = false }
 ```
 
-Redis-backed tests use `redis://127.0.0.1/` by default. Set `ZUG_REDIS_URL` when your Redis
+Redis-backed tests use `redis://127.0.0.1/0` by default. Set `ZUG_REDIS_URL` when your Redis
 7.4+ test server listens on another address or port.
 
 ```sh
-ZUG_REDIS_URL=redis://127.0.0.1:6380/ cargo test --workspace --tests
+ZUG_REDIS_URL=redis://127.0.0.1:6379/0 cargo test --workspace --tests
 ```
 
 ## Quick Start
