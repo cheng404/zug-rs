@@ -156,7 +156,7 @@ EmailWorker::opts()
 .await?;
 ```
 
-See [zug/examples/delayed.rs](zug/examples/delayed.rs) for a complete delayed job example.
+See [examples/src/bin/delayed.rs](examples/src/bin/delayed.rs) for a complete delayed job example.
 
 You can also enqueue by worker name when you want to construct jobs dynamically.
 
@@ -213,7 +213,7 @@ Available options:
 Job creation writes the payload, queue membership, sorted-set score, uniqueness lock, and status
 field in one Redis Function call. Duplicate unique jobs return `None` from `perform_async`.
 See
-[zug/examples/unique.rs](zug/examples/unique.rs) for a complete example.
+[examples/src/bin/unique.rs](examples/src/bin/unique.rs) for a complete example.
 
 ## Worker State
 
@@ -497,7 +497,8 @@ async fn main() -> zug::Result<()> {
 ```
 
 Run it however your application chooses, for example
-`ZUG_REDIS_URL=redis://127.0.0.1/ ZUG_QUEUES=mailers cargo run --bin worker`. The `queues` vector is
+`ZUG_REDIS_URL=redis://127.0.0.1/ ZUG_QUEUES=mailers cargo run -p zug-examples --bin worker`.
+The `queues` vector is
 the set of queues this process will fetch from. `ProcessorConfig::concurrency` sets the shared worker
 pool concurrency. `queue_config` creates queue-specific worker pools that are not processed by the
 shared pool; for example, `QueueConfig::default().concurrency(1)` makes jobs from that queue run
@@ -771,11 +772,11 @@ feature.
 
 ## Examples
 
-- [zug/examples/demo.rs](zug/examples/demo.rs) shows workers, enqueueing, middleware, and scheduled jobs.
-- [zug/examples/worker.rs](zug/examples/worker.rs) shows a caller-owned worker binary.
-- [zug/examples/delayed.rs](zug/examples/delayed.rs) shows one-time delayed jobs.
-- [zug/examples/unique.rs](zug/examples/unique.rs) shows unique job locks.
-- [zug/examples/namespaced_demo.rs](zug/examples/namespaced_demo.rs) shows Redis key namespacing.
+- [examples/src/bin/demo.rs](examples/src/bin/demo.rs) shows workers, enqueueing, middleware, and scheduled jobs.
+- [examples/src/bin/worker.rs](examples/src/bin/worker.rs) shows a caller-owned worker binary.
+- [examples/src/bin/delayed.rs](examples/src/bin/delayed.rs) shows one-time delayed jobs.
+- [examples/src/bin/unique.rs](examples/src/bin/unique.rs) shows unique job locks.
+- [examples/src/bin/namespaced_demo.rs](examples/src/bin/namespaced_demo.rs) shows Redis key namespacing.
 
 ## License and Origin
 
