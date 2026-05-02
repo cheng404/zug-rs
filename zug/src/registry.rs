@@ -165,13 +165,6 @@ macro_rules! register_worker {
         use $root $(:: $segment)+ ::*;
         $processor.register_registered_workers()
     }};
-    ($crate_name:ident :: * $(,)?) => {
-        extern crate $crate_name as _;
-    };
-    ($root:ident $(:: $segment:ident)+ :: * $(,)?) => {
-        #[allow(unused_imports)]
-        use $root $(:: $segment)+ ::*;
-    };
     ($worker:ty, $args:ty $(,)?) => {
         $crate::__private::inventory::submit! {
             $crate::registry::WorkerRegistration {

@@ -324,11 +324,11 @@ Use `Processor::with_queues(redis, queues)` when a process should consume an exp
 This is useful when you intentionally run separate worker processes for different queues, or when
 jobs are produced outside of the registered worker defaults.
 
-If you register workers with `#[derive(Worker)]`, you can also build the processor from registered
-worker defaults:
+If you register workers with `#[derive(Worker)]`, register the inventory workers into a processor:
 
 ```rust
-let mut processor = zug::Processor::from_registered_workers(redis.clone())?;
+let mut processor = zug::Processor::new(redis.clone());
+zug::register_worker!(&mut processor, my_app_workers::*)?;
 processor.run().await;
 ```
 
@@ -429,30 +429,22 @@ impl Worker<ReportArgs> for ReportWorker {
 }
 
 let state = AppState { db };
-let mut processor = zug::Processor::from_registered_workers(redis.clone())?
-    .with_state(state);
+let mut processor = zug::Processor::new(redis.clone()).with_state(state);
+zug::register_worker!(&mut processor, my_app_workers::*)?;
 ```
 
-If workers live in another crate, make sure that crate is linked by the final worker binary. Put the
-link marker at module scope in the worker binary:
+If workers live in another crate, pass the processor to the registration macro so the crate is linked
+and the discovered workers are registered in one step. To consume every registered worker's default
+queue, start from `Processor::new`:
 
 ```rust
-zug::register_worker!(my_app_workers::*);
-```
-
-This marker does not scan worker types itself; it ensures the crate containing the worker registration
-submissions is linked into the final binary so `inventory` can collect them. Additional queue names
-that are not any worker's default queue can be registered with `zug::register_queue!("critical")`
-when you want `Processor::from_registered_workers` to discover them.
-
-To consume every registered worker's default queue, build the processor directly from registered
-workers:
-
-```rust
-zug::register_worker!(my_app_workers::*);
-let mut processor = zug::Processor::from_registered_workers(redis.clone())?;
+let mut processor = zug::Processor::new(redis.clone());
+zug::register_worker!(&mut processor, my_app_workers::*)?;
 processor.run().await;
 ```
+
+Additional queue names that are not any worker's default queue can be registered with
+`zug::register_queue!("critical")`.
 
 To consume an explicit queue subset while still registering all inventory workers, pass the processor
 to the macro:
