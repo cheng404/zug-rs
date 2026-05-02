@@ -727,13 +727,13 @@ pub(crate) async fn fetch_job_atomic_direct(
 
     let job_raw: Option<String> = redis.query_prepared_command(&mut command).await?;
 
-    Ok(job_raw
+    job_raw
         .map(|job_raw| -> Result<Job> {
             let mut job = serde_json::from_str::<Job>(&job_raw)?;
             job.lease_token = Some(lease_token);
             Ok(job)
         })
-        .transpose()?)
+        .transpose()
 }
 
 async fn complete_job_atomic_direct(
