@@ -229,6 +229,49 @@ async fn run_wake_listener(
     debug!("Broke out of loop for Redis wake listener");
 }
 
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(err) => {
+            error!("Error installing SIGTERM handler: {:?}", err);
+            let _ = ctrl_c.await;
+            return;
+        }
+    };
+
+    let mut hangup = match signal(SignalKind::hangup()) {
+        Ok(signal) => signal,
+        Err(err) => {
+            error!("Error installing SIGHUP handler: {:?}", err);
+            let _ = ctrl_c.await;
+            return;
+        }
+    };
+
+    select! {
+        result = &mut ctrl_c => {
+            if let Err(err) = result {
+                error!("Error waiting for Ctrl-C: {:?}", err);
+            }
+        }
+        _ = terminate.recv() => {}
+        _ = hangup.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        error!("Error waiting for Ctrl-C: {:?}", err);
+    }
+}
+
 impl Processor {
     #[must_use]
     pub fn new(redis: RedisPool) -> Self {
@@ -665,6 +708,20 @@ impl Processor {
                 }
 
                 debug!("Broke out of loop for scheduled jobs");
+            }
+        });
+
+        join_set.spawn({
+            let cancellation_token = self.cancellation_token.clone();
+            let cancellation_observer = cancellation_token.clone();
+            async move {
+                select! {
+                    _ = wait_for_shutdown_signal() => {
+                        info!("Shutdown signal received; waiting for running jobs to finish");
+                        cancellation_token.cancel();
+                    }
+                    _ = cancellation_observer.cancelled() => {}
+                }
             }
         });
 

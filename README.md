@@ -365,19 +365,21 @@ let processor = zug::Processor::with_queues(
 That queue is removed from the shared worker pool, so `concurrency(1)` means only one job from this
 queue can execute in this process at a time.
 
-### Config-Driven Runner
+### Worker Binary
 
-For an arq-style worker command, compile a small binary in your application and let Zug build the
-processor from registered workers plus a TOML config file. The command has to live in the final
-application binary because `inventory` collects registrations at link time. Zug re-exports the
-worker registration macros, so application crates only need the normal `zug` dependency.
+For an arq-style worker command, compile a small binary in your application and build the processor
+there. The application owns CLI flags, environment variables, TOML, or any other configuration
+format; Zug provides the Redis pool, processor, worker registry, and schedule builder APIs. The
+command has to live in the final application binary when you use `inventory`, because registrations
+are collected at link time. Zug re-exports the worker registration macros, so application crates only
+need the normal `zug` dependency.
 
-Register workers with `#[derive(Worker)]` after importing `zug::Worker`. The derive macro only
-emits the inventory registration used by the config-driven runner; it does not implement the
+Register workers with `#[derive(Worker)]` after importing `zug::Worker` when you want inventory
+registration. The derive macro only emits inventory metadata; it does not implement the
 `Worker<Args>` trait or the worker's `perform` method. Args are inferred by Rust from your
 `impl Worker<Args> for WorkerType` block. Derived workers must implement `Default` because the
-runner needs a way to construct them during inventory registration. Use `WorkerContext` state for
-database pools, HTTP clients, configuration, and other runtime dependencies.
+registry needs a way to construct them. Use `WorkerContext` state for database pools, HTTP clients,
+configuration, and other runtime dependencies.
 
 Default-constructed worker:
 
@@ -431,9 +433,8 @@ let mut processor = zug::Processor::from_registered_workers(redis.clone())?
     .with_state(state);
 ```
 
-The inventory registration is emitted by the derive macro. If workers live in another crate, make
-sure that crate is linked by the final worker binary. Put the link marker at module scope in the
-worker binary:
+If workers live in another crate, make sure that crate is linked by the final worker binary. Put the
+link marker at module scope in the worker binary:
 
 ```rust
 zug::register_worker!(my_app_workers::*);
@@ -441,12 +442,11 @@ zug::register_worker!(my_app_workers::*);
 
 This marker does not scan worker types itself; it ensures the crate containing the worker registration
 submissions is linked into the final binary so `inventory` can collect them. Additional queue names
-that are not any worker's default queue can be registered with
-`zug::register_queue!("critical")` when you want the runner to discover them without a `queues`
-entry in the TOML file.
+that are not any worker's default queue can be registered with `zug::register_queue!("critical")`
+when you want `Processor::from_registered_workers` to discover them.
 
-The same inventory registrations can be used without the TOML runner. To consume every registered
-worker's default queue, build the processor directly from registered workers:
+To consume every registered worker's default queue, build the processor directly from registered
+workers:
 
 ```rust
 zug::register_worker!(my_app_workers::*);
@@ -463,56 +463,57 @@ zug::register_worker!(&mut processor, my_app_workers::*)?;
 processor.run().await;
 ```
 
-Then add a binary such as `src/bin/worker.rs`:
+When the application owns queue selection and processor settings, add a binary such as
+`src/bin/worker.rs`:
 
 ```rust
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> zug::Result<()> {
     tracing_subscriber::fmt::init();
-    // Only needed when the registered workers live in another crate.
-    zug::register_worker!(my_app_workers::*);
-    zug::cli::run_cli().await
+
+    let redis_url = std::env::var("ZUG_REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    let manager = zug::RedisConnectionManager::new(redis_url)?;
+    let redis = bb8::Pool::builder().build(manager).await?;
+
+    let queues = std::env::var("ZUG_QUEUES")
+        .map(|value| value.split(',').map(str::to_string).collect())
+        .unwrap_or_else(|_| vec!["mailers".to_string()]);
+
+    let config = zug::ProcessorConfig::default()
+        .concurrency(8)
+        .queue_config("mailers".to_string(), zug::QueueConfig::default().concurrency(2))
+        .lease_timeout(Duration::from_secs(30));
+
+    let mut processor = zug::Processor::with_queues(redis.clone(), queues).with_config(config);
+
+    zug::schedule::builder("0 0 8 * * *")?
+        .name("daily email reminder")
+        .queue("mailers")
+        .retry(3)
+        .args(EmailArgs {
+            user_guid: "USR-123".to_string(),
+        })?
+        .register(&mut processor, EmailWorker)
+        .await?;
+
+    processor.run().await;
+    Ok(())
 }
 ```
 
-Run it with `cargo run --bin worker -- run --config zug.toml`. With no arguments, the runner
-uses `zug.toml`; `ZUG_REDIS_URL` is used when `redis_url` is omitted.
-
-```toml
-redis_url = "redis://127.0.0.1/"
-queues = [
-    { name = "critical", concurrency = 4 },
-    { name = "mailers" },
-    { name = "reports", concurrency = 1 },
-]
-
-[processor]
-concurrency = 8
-balance_strategy = "round_robin"
-poll_interval_ms = 500
-lease_timeout_secs = 30
-
-[[schedules]]
-name = "daily email reminder"
-worker_name = "email.reminder"
-cron = "0 0 8 * * *"
-queue = "mailers"
-retry = 3
-args = { user_guid = "USR-123" }
-```
-
-`queues` is the set of queues this process will fetch from. When `queues` is omitted, the runner
-uses registered queue names plus the default queues from registered workers. `[processor].concurrency`
-sets the shared worker pool concurrency. A queue entry with `concurrency` gets its own worker pool
-and is not processed by the shared pool; for example, `{ name = "reports", concurrency = 1 }` makes
-report jobs run serially in this process.
-Scheduled jobs must set exactly one of `worker` or `worker_name`. `worker` is the exact serialized
-worker class name; by default this is the full Rust type path, such as
-`my_app::workers::EmailWorker`. `worker_name` is the stable config alias registered by
-`#[zug(name = "email.reminder")]` on `#[derive(Worker)]`. Duplicate `worker_name` aliases are
-rejected when the runner builds the processor. When `queue` is omitted, the runner uses the worker's
-default queue from `Worker::opts`.
+Run it however your application chooses, for example
+`ZUG_REDIS_URL=redis://127.0.0.1/ ZUG_QUEUES=mailers cargo run --bin worker`. The `queues` vector is
+the set of queues this process will fetch from. `ProcessorConfig::concurrency` sets the shared worker
+pool concurrency. `queue_config` creates queue-specific worker pools that are not processed by the
+shared pool; for example, `QueueConfig::default().concurrency(1)` makes jobs from that queue run
+serially in this process. Scheduled jobs are registered with `zug::schedule::builder`, so your
+application can translate its own config format into typed workers and args before calling Zug.
+`Processor::run` handles Ctrl-C, SIGTERM, and SIGHUP by cancelling new fetches and waiting for
+currently running jobs to finish before returning. SIGKILL cannot be handled by any process; those
+jobs are retried after their Redis lease expires.
 
 Zug uses at-least-once execution. A job remains in Redis until it succeeds or reaches a terminal
 failure state. Fetching a job creates an `in-progress:<job_id>` lease with `SET NX EX`; if a worker
@@ -712,8 +713,8 @@ processor.register(ReportWorker {
 
 By default, Zug uses the full Rust type path as the serialized worker name, including the crate
 and module path. This avoids collisions when two modules define workers with the same type name.
-The config-driven runner does not guess short type names. In TOML schedules, use `worker` for the
-exact serialized class name, or use `worker_name` for a stable alias declared on the derive macro.
+`#[zug(name = "...")]` registers a stable inventory alias that your application can use when it
+owns a config file or admin UI. It does not change the serialized class name stored in Redis.
 
 ```rust
 use zug::Worker;
@@ -721,13 +722,6 @@ use zug::Worker;
 #[derive(Worker, Clone, Default)]
 #[zug(name = "email.reminder")]
 struct EmailWorker;
-```
-
-```toml
-[[schedules]]
-name = "daily email reminder"
-worker_name = "email.reminder"
-cron = "0 0 8 * * *"
 ```
 
 Override `class_name` only when you intentionally want to change the serialized worker class stored
@@ -786,7 +780,7 @@ feature.
 ## Examples
 
 - [zug/examples/demo.rs](zug/examples/demo.rs) shows workers, enqueueing, middleware, and scheduled jobs.
-- [zug/examples/cli_worker.rs](zug/examples/cli_worker.rs) shows the TOML-driven runner and worker registration macros.
+- [zug/examples/worker.rs](zug/examples/worker.rs) shows a caller-owned worker binary.
 - [zug/examples/delayed.rs](zug/examples/delayed.rs) shows one-time delayed jobs.
 - [zug/examples/unique.rs](zug/examples/unique.rs) shows unique job locks.
 - [zug/examples/namespaced_demo.rs](zug/examples/namespaced_demo.rs) shows Redis key namespacing.

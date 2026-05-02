@@ -1,4 +1,3 @@
-pub mod cli;
 pub mod registry;
 pub mod schedule;
 
@@ -41,9 +40,6 @@ pub enum Error {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
-
-    #[error(transparent)]
-    Toml(#[from] toml::de::Error),
 
     #[error(transparent)]
     Cron(#[from] cron::error::Error),

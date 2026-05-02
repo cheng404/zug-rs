@@ -40,7 +40,6 @@ sha2 = "0.11"
 tracing = "0.1"
 inventory = "0.3"
 indexmap = "2"
-toml = "0.9"
 zug-macros = { path = "../zug-macros" }
 
 [dev-dependencies]
